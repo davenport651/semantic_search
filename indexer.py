@@ -2,7 +2,7 @@
 """
 indexer.py — Semantic Desktop Search Backend
 ============================================
-Crawls the specified directory (e.g., F:\), extracts text and metadata,
+Crawls the specified directory (e.g., F:\\), extracts text and metadata,
 asks an LLM (KoboldCpp) to summarize the content, embeds the summary,
 and stores it in a local ChromaDB vector database.
 
@@ -38,7 +38,8 @@ except ImportError:
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-TARGET_DIR = "F:\\"
+#TARGET_DIR = "F:\\"
+TARGET_DIR = "C:\\Users\\mdavenport\\OneDrive - Delta Charter Township\\Documents"
 DB_DIR = "chroma_db"
 STATE_FILE = "indexer_state.json"
 
@@ -93,53 +94,49 @@ class IndexerState:
 
 # ── AI Clients ───────────────────────────────────────────────────────────────
 
-def get_llm_summary(filename: str, content_preview: str, is_image: bool = False, image_path: Optional[str] = None) -> str:
+def get_llm_summary(filename: str, content_preview: str,
+                    is_image: bool = False,
+                    image_path: Optional[str] = None,
+                    image_bytes: Optional[bytes] = None) -> str:
+
     """Ask KoboldCpp/Gemma3 to summarize the file.
     
     For images, sends the actual image bytes to the vision model via the
     OpenAI-compatible multimodal chat completions endpoint.
     For text files, sends a content preview as a plain text prompt.
     """
-    if is_image and image_path:
-        # --- Vision path: send real image data ---
-        try:
-            with open(image_path, "rb") as img_file:
-                img_bytes = img_file.read()
-            img_b64 = base64.b64encode(img_bytes).decode("utf-8")
-            
-            # Determine MIME type from extension
-            ext = Path(image_path).suffix.lower()
-            mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-                        ".png": "image/png", ".webp": "image/webp"}
-            mime_type = mime_map.get(ext, "image/jpeg")
-            
-            messages = [{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{mime_type};base64,{img_b64}"}
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            f"You are a file-indexing assistant. Describe the content of this image "
-                            f"in 1 or 2 concise sentences for use in a search engine index. "
-                            f"Focus on what is actually visible: people, objects, text, setting, or style. "
-                            f"The filename is '{filename}'."
-                        )
-                    }
-                ]
-            }]
-        except Exception as e:
-            logging.warning(f"Could not read image file {filename} for vision: {e}")
-            # Fall back to filename-only summary
-            return f"Image file named '{filename}' (vision read failed)."
-    elif is_image:
-        # No path provided — shouldn't happen, but safe fallback
+    # Resolve image bytes — either from a file path or passed directly
+    if is_image or image_bytes:
+        if image_bytes:
+            img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+            mime_type = "image/png"
+        elif image_path:
+            try:
+                with open(image_path, "rb") as f:
+                    img_b64 = base64.b64encode(f.read()).decode("utf-8")
+                ext = Path(image_path).suffix.lower()
+                mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                            ".png": "image/png", ".webp": "image/webp"}
+                mime_type = mime_map.get(ext, "image/jpeg")
+            except Exception as e:
+                logging.warning(f"Could not read image {filename}: {e}")
+                return f"Image file named '{filename}' (read failed)."
+        else:
+            return f"Image file named '{filename}'."
+
         messages = [{
             "role": "user",
-            "content": f"Write a 1-sentence description for a search index about an image file named '{filename}'."
+            "content": [
+                {"type": "image_url",
+                 "image_url": {"url": f"data:{mime_type};base64,{img_b64}"}},
+                {"type": "text",
+                 "text": (
+                     f"You are a file-indexing assistant. Describe the content of this image "
+                     f"in 1 or 2 concise sentences for a search engine index. "
+                     f"Focus on what is visible: people, objects, text, diagrams, or style. "
+                     f"The filename is '{filename}'."
+                 )}
+            ]
         }]
     else:
         # --- Text path: send content preview ---
@@ -147,7 +144,7 @@ def get_llm_summary(filename: str, content_preview: str, is_image: bool = False,
         prompt = (
             f"You are a helpful file-indexing assistant. Summarize the following file content "
             f"in 1 or 2 concise, descriptive sentences so it can be found in a search engine.\n\n"
-            f"Filename: {filename}\n"
+            #f"Filename: {filename}\n"
             f"Content Preview:\n---\n{preview}\n---\n\n"
             f"Summary:"
         )
@@ -200,6 +197,22 @@ def extract_text(path: Path) -> str:
         
     return ""
 
+def render_pdf_page_to_bytes(path: Path, page_index: int = 0, dpi: int = 150) -> Optional[bytes]:
+    """Render a single PDF page to PNG bytes using PyMuPDF."""
+    if not fitz:
+        return None
+    try:
+        with fitz.open(path) as doc:
+            if len(doc) == 0:
+                return None
+            page = doc[page_index]
+            # 150 DPI is plenty for a vision model to read text
+            mat = fitz.Matrix(dpi / 72, dpi / 72)
+            pix = page.get_pixmap(matrix=mat)
+            return pix.tobytes("png")
+    except Exception as e:
+        logging.warning(f"Could not rasterize {path.name}: {e}")
+        return None
 
 # ── Cleanup ─────────────────────────────────────────────────────────────────
 
@@ -257,6 +270,7 @@ def main():
             path = Path(root) / file
             ext = path.suffix.lower()
 
+            logging.info(f"Found file: {path} ({ext})")
             if ext in IGNORE_EXTS:
                 continue
 
@@ -278,16 +292,23 @@ def main():
             logging.info(f"Indexing: {path.name}")
             
             is_image = ext in IMAGE_EXTS
+            image_bytes = None
             content = ""
+
             if not is_image:
                 content = extract_text(path)
+                # If PDF came back empty, rasterize page 1 for vision
+                if not content.strip() and ext in PDF_EXTS:
+                    logging.info(f"  No text layer found in {path.name}, falling back to vision...")
+                    image_bytes = render_pdf_page_to_bytes(path)
 
             # 1. Summarize with LLM (pass image_path for vision inference)
             summary = get_llm_summary(
                 path.name,
                 content,
                 is_image=is_image,
-                image_path=abs_path if is_image else None
+                image_path=abs_path if is_image else None,
+                image_bytes=image_bytes
             )
             
             # 2. Embed the summary
